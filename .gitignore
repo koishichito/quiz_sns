@@ -1,0 +1,20 @@
+# 環境変数(秘密情報を含むため絶対にコミットしない)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# pytest
+.pytest_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# SQLite(テスト・開発時の生成物)
+*.db
+*.sqlite3

@@ -1,0 +1,14 @@
+# --- アプリ本体 ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+SQLAlchemy>=2.0
+PyMySQL>=1.1            # MySQL用の同期ドライバ(純Python)
+cryptography>=42        # MySQL 8 既定の caching_sha2_password 認証に必須。無いとログイン時にエラー
+python-multipart>=0.0.9 # OAuth2PasswordRequestForm(フォーム受信)に必須
+bcrypt>=4.1             # パスワードハッシュ。passlib は経由しない(メンテ停止のため)
+PyJWT>=2.9              # JWTの発行/検証。python-jose は使わない(同上)
+pydantic-settings>=2.4  # .env から設定を読む
+
+# --- テスト ---
+pytest>=8.0
+httpx>=0.27             # TestClient の実体
