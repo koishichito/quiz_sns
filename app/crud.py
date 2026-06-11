@@ -35,31 +35,60 @@
     f(title=..., question=..., ...) と書いたのと同じになる。
 """
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from . import models, schemas
-from .auth import hash_password
 
 
 # ---------- User ----------
 
-def get_user_by_username(db: Session, username: str) -> models.User | None:
-    # ユーザー名で1件引く。unique 制約があるので最大1件しか存在しない
+def get_user_by_sub(db: Session, keycloak_sub: str) -> models.User | None:
+    # Keycloak の sub(不変ID)で1件引く。unique 制約があるので最大1件しか存在しない
     return db.scalars(
-        select(models.User).where(models.User.username == username)
+        select(models.User).where(models.User.keycloak_sub == keycloak_sub)
     ).first()
 
 
-def create_user(db: Session, data: schemas.UserCreate) -> models.User:
-    user = models.User(
-        username=data.username,
-        hashed_password=hash_password(data.password),  # 保存前に必ずハッシュ化
-    )
-    db.add(user)      # セッションに登録(まだSQLは飛ばない。INSERT予約のような状態)
-    db.commit()       # ここで INSERT が flush され、トランザクションが確定する
-    db.refresh(user)  # DB側で採番された id や server_default の created_at を
-                      # SELECT し直してオブジェクトへ反映する。
-                      # これをしないと user.id が手元で使えない
+def get_or_create_user(db: Session, *, keycloak_sub: str, username: str) -> models.User:
+    """JITプロビジョニング: 検証済みトークンのユーザーのDB行を「無ければ作る」。
+
+    ユーザー登録はKeycloakの仕事になったので、アプリ側の users 行は
+    「最初にAPIへアクセスされた瞬間」に自動作成する。
+    毎リクエスト get_current_user から呼ばれるが、基本はSELECT1回で済み、
+    INSERTが走るのはそのユーザーの初回だけ。
+
+    引数リストの * は「これ以降はキーワード引数でしか渡せない」の意。
+    get_or_create_user(db, sub値, name値) のような位置渡しを禁止することで、
+    同じ str 型の2引数を取り違えるバグを呼び出し時点で防ぐ。
+    """
+    user = get_user_by_sub(db, keycloak_sub)
+
+    if user is None:
+        user = models.User(keycloak_sub=keycloak_sub, username=username)
+        db.add(user)      # セッションに登録(まだSQLは飛ばない。INSERT予約のような状態)
+        try:
+            db.commit()   # ここで INSERT が flush され、トランザクションが確定する
+        except IntegrityError:
+            # 同じ人の「初回リクエスト」が2本並行で走ると、両方が「行が無い」と
+            # 判断して INSERT し、遅い方が keycloak_sub の unique 制約で弾かれて
+            # ここに来る。巻き戻して、先に勝った方の行を読み直せば正常続行できる。
+            # 存在チェックとINSERTの間の競合は、最後はDBの制約で守る(従来の
+            # username 重複対策と同じ考え方の、JIT版)
+            db.rollback()
+            user = get_user_by_sub(db, keycloak_sub)
+        else:
+            db.refresh(user)  # DB側で採番された id や server_default の created_at を
+                              # SELECT し直してオブジェクトへ反映する。
+                              # これをしないと user.id が手元で使えない
+        return user
+
+    if user.username != username:
+        # Keycloak側でユーザー名が変更された場合、表示用の写しを追従させる。
+        # 紐付けキーが sub だからこそ、改名しても同一ユーザーとして扱える
+        user.username = username
+        db.commit()
+        db.refresh(user)
     return user
 
 

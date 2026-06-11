@@ -66,19 +66,23 @@ class User(Base):
     # commit 後に refresh で読み戻す(crud.py 参照)
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
+    # Keycloak が発行する不変のユーザーID(トークンの sub クレーム。UUID形式36文字)。
+    # アプリ内の主キー id とは別物で、「Keycloak上の誰か」と「アプリDBの行」を
+    # つなぐ外部連携キー。毎リクエストこの値で検索するので index 必須。
+    # unique=True は同じ人の行が2つできないための最後の砦
+    # (JITプロビジョニングの並行実行対策。crud.get_or_create_user 参照)。
     # MySQL の VARCHAR は長さ指定が必須。素の String だと create_all の
     # DDL生成時に落ちる(SQLite は許すので、SQLiteだけで開発していると
-    # MySQLに繋いだ瞬間に発覚する罠)。
-    # unique=True: 一意制約。重複INSERTはDBがエラーで拒否する(最後の砦)。
-    # index=True: 検索用インデックス。ログインのたびに username で
-    # 検索するので、無いとユーザー数に比例して遅くなる
-    username: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    # MySQLに繋いだ瞬間に発覚する罠)
+    keycloak_sub: Mapped[str] = mapped_column(String(36), unique=True, index=True)
 
-    # 平文パスワードは絶対に保存しない。bcrypt ハッシュ(60文字前後)を
-    # 入れる前提で余裕を見て255。カラム名を password ではなく
-    # hashed_password にしてあるのは「ここに平文が入ったら名前からして
-    # 異常」と気づけるようにする命名上の防御
-    hashed_password: Mapped[str] = mapped_column(String(255))
+    # 表示用ユーザー名。Keycloak の preferred_username の【写し(キャッシュ)】。
+    # hashed_password カラムは消えた ―― パスワードを預かるのはKeycloakの仕事に
+    # なったので、漏洩リスクごとアプリから消滅した。
+    # 自前認証時代は unique=True だったが、ユーザー名の一意性を管理する責任も
+    # Keycloak 側へ移ったので、アプリ側では一意制約を持たない
+    # (真実が2箇所にあると必ず食い違う ―― Single Source of Truth の原則)
+    username: Mapped[str] = mapped_column(String(255), index=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now()  # DB側で CURRENT_TIMESTAMP を入れる

@@ -1,45 +1,52 @@
 """結合テスト: 本物のHTTPリクエストの形でAPI全体を通しで検証する。
 
-━━ ここが依存性注入の最大の見せ場 ━━━━━━━━━━━━━━━━━━━━
-app.dependency_overrides[get_db] = override_get_db の【1行】で、
-アプリ本体のコードを1文字も変えずに MySQL → インメモリSQLite へ差し替わる。
-「資源を自分で作らず引数で受け取る設計にしておいたから、外から付け替えられる」
-―― DIの実利が最も具体的な形で現れる場所。
+━━ 外部依存を【2つとも】偽物に差し替える ━━━━━━━━━━━━━━━━
+本番では MySQL と Keycloak という2つの外部プロセスに依存するが、
+テストでは両方を差し替えて、ネットワーク無しで全経路を検証する。
 
-━━ このテストの層について ━━━━━━━━━━━━━━━━━━━━━━━━━━
-関数単体のユニットテストではなく、
-HTTP → ルーティング → 検証 → DI → CRUD → DB → 直列化
-の全経路を通す【結合テスト】。FastAPI は TestClient のおかげで
-結合テストが安く書けるので、まずここから固めるのが効率的。
+(1) DB: MySQL → インメモリSQLite
+    app.dependency_overrides[get_db] の【1行】で、アプリ本体のコードを
+    1文字も変えずに差し替わる。依存性注入の最大の見せ場(従来どおり)。
+
+(2) 認証: Keycloak → テストが自作したRSA鍵ペア
+    テストがRSA鍵ペアを生成し、「秘密鍵で署名したトークン」を自分で作り、
+    「公開鍵を返す偽JWKSクライアント」を app.auth.jwks_client へ差し込む。
+    つまり【テストがKeycloakに成り代わる】。
+    重要なのは、署名・期限・発行者(iss)の検証コードは本物のまま通ること。
+    get_current_user を丸ごと差し替える方式だと、検証ロジックが一切
+    テストされなくなる。偽物にするのは「外部との境界(公開鍵の入手)」
+    だけに絞る ―― どこを切ってモックするかが、モック設計の核心。
 
 実行: プロジェクトルートで  pytest tests/ -q
-pytest は test_ で始まる関数を自動収集して実行し、
-assert が False になったらその場で失敗として報告する。
 
 ━━ このファイルで登場する記法 ━━━━━━━━━━━━━━━━━━━━━━━━
-- assert 条件, メッセージ
-    条件が False なら AssertionError。第2引数(res.text 等)は
-    失敗時に表示されるので、デバッグの手がかりとして仕込んでおく。
+- uuid.uuid5(名前空間, 名前)
+    名前から決定的に作るUUID(同じ入力なら必ず同じ値)。乱数版の uuid4 と
+    違い、テスト中「同じ username = 同じ sub = 同じ人物」を再現できる。
 - {**SAMPLE_QUIZ, "answer_index": 99}
     dict のコピー+一部キーの上書き(マージ記法)。元の dict は変更されない。
-- f"Bearer {token}"
-    f文字列。{} 内の式を評価して文字列に埋め込む。
 """
 import os
+import uuid
+from datetime import datetime, timedelta, timezone
 
 # ━ app パッケージを import する【前】に環境変数を立てる(この順序が重要)━
 # config.py は import された瞬間に Settings() を実行して環境変数 / .env を読む。
-# .env の無いCI環境でもデフォルト値で動きはするが、万一にも本物のMySQLを
-# 読みに行かないよう、無害な値で明示的に塞いでおく保険。
+# 万一にも本物のMySQL・本物のKeycloakを参照しないよう、無害な値で塞いでおく保険。
 # setdefault = 「未設定のときだけセット」(既にある設定は尊重する)
 os.environ.setdefault("DATABASE_URL", "sqlite://")
-os.environ.setdefault("SECRET_KEY", "test-secret-key-not-for-production")
+os.environ.setdefault("KEYCLOAK_SERVER_URL", "http://keycloak.test")
+os.environ.setdefault("KEYCLOAK_REALM", "quiz-sns-test")
 
+import jwt
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app import auth as auth_module
+from app.config import settings
 from app.database import Base, get_db
 from app.main import app
 
@@ -76,16 +83,38 @@ def override_get_db():
         db.close()
 
 
-# ━ DIの差し替え本体 ━
-# dependency_overrides の正体はただの dict。
-# 「キーの関数が Depends で要求されたら、代わりに値の関数を呼べ」という対応表で、
-# アプリ中の Depends(get_db) が(get_current_user の中のものも含めて)
-# 全部 override_get_db に化ける
+# ━ DIの差し替え本体(その1: DB)━
 app.dependency_overrides[get_db] = override_get_db
 
+
+# ---- 偽Keycloak: 自作のRSA鍵ペアと偽JWKSクライアント ----
+# 鍵生成はモジュール読み込み時に1回だけ(時間がかかる処理なので、
+# テスト関数ごとに作り直さない)
+_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+_PUBLIC_KEY = _PRIVATE_KEY.public_key()
+# 「正規ではない別の鍵」。偽造トークンが弾かれることのテスト用
+_ATTACKER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+class _FakeSigningKey:
+    """PyJWKClient が返すオブジェクトの代役。本物も .key に鍵を持つ入れ物にすぎない。"""
+    def __init__(self, key):
+        self.key = key
+
+
+class _FakeJWKSClient:
+    """本物の PyJWKClient は Keycloak へHTTPアクセスして kid に合う公開鍵を探す。
+    偽物は無条件で自作の公開鍵を返す(= テストがKeycloakのフリをする)。"""
+    def get_signing_key_from_jwt(self, token):
+        return _FakeSigningKey(_PUBLIC_KEY)
+
+
+# ━ 差し替え本体(その2: Keycloak)━
+# get_current_user は呼び出しのたびにモジュール変数 jwks_client を参照するので、
+# ここで属性ごと挿げ替えれば、以降の全リクエストで偽物が使われる
+auth_module.jwks_client = _FakeJWKSClient()
+
 # TestClient: アプリをネットワーク無しで直接叩けるHTTPクライアント。
-# client.post("/auth/register", json=...) と本物そっくりに使えるが、
-# 実際はソケットを介さずASGI関数を直接呼んでいる(高速・ポート不要)。
 # with TestClient(app) as c: の形にすると lifespan(= 本物のengineへの
 # create_all)が走ってしまうため、今回はあえて with なしで生成して回避している
 client = TestClient(app)
@@ -93,23 +122,36 @@ client = TestClient(app)
 
 # ---------- ヘルパー(テスト間の重複排除) ----------
 
-def register(username: str, password: str = "password123"):
-    return client.post(
-        "/auth/register", json={"username": username, "password": password}
-    )
+def issue_token(
+    username: str,
+    *,
+    issuer: str | None = None,
+    expires_in_minutes: int = 60,
+    key=None,
+) -> str:
+    """Keycloakが発行するアクセストークンの最小再現。
+
+    sub は username から uuid5 で決定的に導出するので、同じ username で
+    何度呼んでも「同一人物のトークン」になる(JITプロビジョニングが
+    毎回ユーザーを作り直していないことを検証できる)。
+    issuer / 期限 / 署名鍵 を引数で差し替えられるようにしてあるのは、
+    「正規でないトークンが【ちゃんと弾かれる】こと」もテストするため。
+    """
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(uuid.uuid5(uuid.NAMESPACE_URL, username)),
+        "preferred_username": username,
+        "iss": issuer or settings.keycloak_issuer,
+        "iat": now,
+        "exp": now + timedelta(minutes=expires_in_minutes),
+    }
+    return jwt.encode(payload, key or _PRIVATE_KEY, algorithm="RS256")
 
 
-def login_headers(username: str, password: str = "password123") -> dict:
-    """ログインして Authorization ヘッダーの形(dict)にして返す。"""
-    res = client.post(
-        "/auth/login",
-        # OAuth2PasswordRequestForm はJSONではなくフォーム形式を要求する。
-        # httpx/TestClient では json= ではなく data= で送る(json= だと422になる)
-        data={"username": username, "password": password},
-    )
-    assert res.status_code == 200, res.text
-    token = res.json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
+def auth_headers(username: str) -> dict:
+    """自前認証時代の login_headers の後継。ログインAPIを叩く代わりに
+    トークンを自家発行する(Keycloak役はテスト自身なので)。"""
+    return {"Authorization": f"Bearer {issue_token(username)}"}
 
 
 SAMPLE_QUIZ = {
@@ -128,42 +170,7 @@ SAMPLE_QUIZ = {
 
 # ---------- 認証まわり ----------
 
-def test_register_returns_201_and_hides_password():
-    res = register("keisuke")
-    assert res.status_code == 201
-    body = res.json()
-    assert body["username"] == "keisuke"
-    assert "id" in body and "created_at" in body
-    # response_model=UserRead のフィルタが効いている証拠:
-    # DB(ORMオブジェクト)側には hashed_password が存在するが、
-    # レスポンスのJSONには現れない
-    assert "hashed_password" not in body
-    assert "password" not in body
-
-
-def test_register_duplicate_username_returns_409():
-    register("dup_user")
-    res = register("dup_user")  # 2回目は重複
-    assert res.status_code == 409
-
-
-def test_login_success_and_wrong_password():
-    register("login_user")
-    ok = client.post(
-        "/auth/login", data={"username": "login_user", "password": "password123"}
-    )
-    assert ok.status_code == 200
-    assert ok.json()["token_type"] == "bearer"
-
-    ng = client.post(
-        "/auth/login", data={"username": "login_user", "password": "wrong-password"}
-    )
-    assert ng.status_code == 401
-
-
-# ---------- クイズ投稿 ----------
-
-def test_create_quiz_requires_auth():
+def test_request_without_token_returns_401():
     # ボディは完全に正しいが Authorization ヘッダーが無い。
     # 返るのは 422 ではなく【401】―― 依存解決(oauth2_scheme)が準備フェーズで
     # 先に例外を投げるため、本体どころかボディ検証の結果すら待たない。
@@ -172,9 +179,56 @@ def test_create_quiz_requires_auth():
     assert res.status_code == 401
 
 
+def test_me_provisions_user_and_hides_internal_fields():
+    res = client.get("/auth/me", headers=auth_headers("keisuke"))
+    assert res.status_code == 200, res.text
+    body = res.json()
+    # アプリには登録エンドポイントが存在しないのにユーザーが返ってくる
+    # = 初回アクセス時のJITプロビジョニングが働いた証拠
+    assert body["username"] == "keisuke"
+    assert "id" in body and "created_at" in body
+    # response_model=UserRead のフィルタが効いている証拠:
+    # DB(ORMオブジェクト)側には keycloak_sub が存在するが、
+    # レスポンスのJSONには現れない
+    assert "keycloak_sub" not in body
+    assert "hashed_password" not in body  # そもそもカラムごと消えている
+
+
+def test_same_user_maps_to_same_db_row():
+    first = client.get("/auth/me", headers=auth_headers("repeat_user")).json()
+    second = client.get("/auth/me", headers=auth_headers("repeat_user")).json()
+    # 2回目はINSERTされず既存行が返る(JITが「毎回作る」になっていないこと)。
+    # sub が同じなら、何度来ても同一の users 行に対応づく
+    assert first["id"] == second["id"]
+
+
+def test_token_signed_with_wrong_key_returns_401():
+    # 正規でない鍵で署名 = 偽造トークン。ペイロードの中身は完璧でも
+    # 署名検証で落ちる。これが公開鍵方式の守りの本体
+    token = issue_token("attacker", key=_ATTACKER_KEY)
+    res = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 401
+
+
+def test_expired_token_returns_401():
+    token = issue_token("late_user", expires_in_minutes=-5)  # 5分前に失効済み
+    res = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 401
+
+
+def test_token_from_other_realm_returns_401():
+    # 署名は正規の鍵(= 正規のKeycloakが発行した形)だが、発行者が別realm。
+    # iss 検証が無いと「よそのrealmの正規ユーザー」がこのAPIを通れてしまう。
+    # 署名検証だけでは防げない攻撃を issuer= の指定が塞いでいることの実証
+    token = issue_token("outsider", issuer="http://keycloak.test/realms/other-app")
+    res = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 401
+
+
+# ---------- クイズ投稿 ----------
+
 def test_create_quiz_success():
-    register("author1")
-    headers = login_headers("author1")
+    headers = auth_headers("author1")
     res = client.post("/quizzes", json=SAMPLE_QUIZ, headers=headers)
     assert res.status_code == 201, res.text
     body = res.json()
@@ -184,12 +238,11 @@ def test_create_quiz_success():
     # ボディに owner 情報など一切送っていないのに author1 になっている
     # = サーバがトークンから投稿者を決定している証拠
     assert body["owner"]["username"] == "author1"
-    assert "hashed_password" not in body["owner"]
+    assert "keycloak_sub" not in body["owner"]
 
 
 def test_create_quiz_answer_index_out_of_range_returns_422():
-    register("author2")
-    headers = login_headers("author2")
+    headers = auth_headers("author2")
     bad = {**SAMPLE_QUIZ, "answer_index": 99}  # 99番の選択肢は存在しない
     res = client.post("/quizzes", json=bad, headers=headers)
     # schemas.QuizCreate の model_validator がエンドポイント関数の手前で弾く。
@@ -198,8 +251,7 @@ def test_create_quiz_answer_index_out_of_range_returns_422():
 
 
 def test_list_quizzes():
-    register("author3")
-    headers = login_headers("author3")
+    headers = auth_headers("author3")
     client.post("/quizzes", json=SAMPLE_QUIZ, headers=headers)
     res = client.get("/quizzes")  # 一覧は認証不要
     assert res.status_code == 200
@@ -214,10 +266,8 @@ def test_list_quizzes():
 
 def test_comment_flow():
     # 登場人物2人: クイズの投稿者と、コメントする別人
-    register("quiz_owner")
-    register("commenter")
-    owner_h = login_headers("quiz_owner")
-    commenter_h = login_headers("commenter")
+    owner_h = auth_headers("quiz_owner")
+    commenter_h = auth_headers("commenter")
 
     quiz_id = client.post("/quizzes", json=SAMPLE_QUIZ, headers=owner_h).json()["id"]
 
@@ -249,8 +299,7 @@ def test_comment_flow():
 
 
 def test_comment_on_missing_quiz_returns_404():
-    register("commenter2")
-    headers = login_headers("commenter2")
+    headers = auth_headers("commenter2")
     res = client.post(
         "/quizzes/999999/comments", json={"body": "どこ宛?"}, headers=headers
     )
@@ -260,15 +309,15 @@ def test_comment_on_missing_quiz_returns_404():
 # ---------- 削除(認可) ----------
 
 def test_delete_quiz_authorization():
-    register("real_owner")
-    register("intruder")
-    owner_h = login_headers("real_owner")
-    intruder_h = login_headers("intruder")
+    owner_h = auth_headers("real_owner")
+    intruder_h = auth_headers("intruder")
 
     quiz_id = client.post("/quizzes", json=SAMPLE_QUIZ, headers=owner_h).json()["id"]
 
     # 他人のクイズは消せない: 認証(誰かは分かる)は通るが認可(権利)で 403。
-    # 401と403の違いが、そのままテストの形になっている
+    # 401と403の違いが、そのままテストの形になっている。
+    # 認証がKeycloakへ移っても【認可はアプリの仕事のまま】である点に注目 ――
+    # 「このクイズの持ち主は誰か」はアプリのDBにしか無い知識
     res = client.delete(f"/quizzes/{quiz_id}", headers=intruder_h)
     assert res.status_code == 403
 

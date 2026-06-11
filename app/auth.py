@@ -1,126 +1,91 @@
-"""認証まわり: パスワードハッシュ化・JWT発行・「現在のユーザー」依存関係。
+"""認証まわり: Keycloakが発行したトークンの検証と「現在のユーザー」依存関係。
 
-━━ 全体の流れ(トークン認証のライフサイクル)━━━━━━━━━━━━━━
-  [登録]     平文パスワード → hash_password → DBには hashed_password を保存
-  [ログイン] 平文パスワード → verify_password で照合 → 成功なら
-             create_access_token で JWT を発行してクライアントへ渡す
-  [以降毎回] クライアントは Authorization: Bearer <JWT> ヘッダを付けて送る
-             → get_current_user がトークンを検証して User を復元する
+━━ 認証の構造(自前認証 → Keycloak委譲)━━━━━━━━━━━━━━━━
+以前はこのアプリ自身がパスワードを預かり、トークンを発行していた
+(認証サーバとAPIサーバの一人二役)。Keycloak 導入後の役割分担:
 
-サーバ側はログイン状態を一切記憶しない(ステートレス)。
-「誰か」の証明は毎リクエスト、トークンの署名検証だけで完結する。
-これがセッション方式と対比したときのJWT方式の本質。
+  Keycloak(IdP: Identity Provider)
+    ユーザー登録・パスワード保管・ログイン・トークン発行をすべて担当。
+  このアプリ(リソースサーバ)
+    届いたトークンを【検証するだけ】。パスワードにはもう一切触らない
+    (bcrypt も /auth/register も /auth/login もアプリから消えた)。
 
-━━ JWT(JSON Web Token)とは ━━━━━━━━━━━━━━━━━━━━━━━━
-  xxxxx.yyyyy.zzzzz というドット区切り3部構成の文字列。
-    xxxxx = ヘッダ(アルゴリズム情報)の base64url
-    yyyyy = ペイロード(sub=主体, exp=期限 などの「クレーム」)の base64url
-    zzzzz = 前2つを SECRET_KEY で署名(HMAC-SHA256)したもの
-  最重要: base64 は【暗号化ではない】。ペイロードは誰でもデコードして読める。
-  守られているのは機密性ではなく完全性 ―― 1文字でも改竄すれば署名が
-  合わなくなるので、サーバは「自分が発行したまま無傷である」ことを検証できる。
-  だからペイロードに秘密情報を入れてはいけない(user_id 程度に留める)。
+  [ログイン]  クライアント ──(username/password)──▶ Keycloak
+              クライアント ◀──(アクセストークン JWT)── Keycloak
+  [以降毎回]  クライアント ──(Authorization: Bearer <token>)──▶ このアプリ
+              このアプリは Keycloak の【公開鍵】で署名を検証して受け入れる。
+              検証のたびに Keycloak へ問い合わせるわけではない(下記JWKS参照)。
 
-━━ get_current_user = 依存性注入の代表例その2 ━━━━━━━━━━━━
-「ヘッダのトークンを検証し、対応する User をDBから引いて返す」という
-横断的処理を、必要なエンドポイントが Depends で1行宣言するだけで再利用できる。
-しかも get_current_user 自身が oauth2_scheme と get_db に Depends している
-= 依存関係は入れ子にでき、全体が木構造(依存ツリー)を成す。
+━━ HS256 → RS256(共通鍵 → 公開鍵方式)━━━━━━━━━━━━━━━━
+自前認証時代は HS256(共通鍵)だった。発行者と検証者が同一サーバなら、
+1本の SECRET_KEY で署名も検証もできて十分。
+いまは発行者(Keycloak)と検証者(このアプリ)が別プロセスになった。
+共通鍵を両者で共有すると「検証できる者は誰でも偽造もできる」ことになる。
+そこで RS256(公開鍵方式):
+  署名 = Keycloak だけが持つ【秘密鍵】で行う → 偽造できるのはKeycloakだけ
+  検証 = 公開してよい【公開鍵】で行う     → 漏れても偽造には使えない
+検証側のサービスが何個に増えても安全性が落ちない。複数のサービスが
+1つのIdPを共有する構成(SSO)の土台がこれ。
 
-━━ このファイルで登場する記法 ━━━━━━━━━━━━━━━━━━━━━━━━
-- plain.encode("utf-8") / .decode("utf-8")
-    str(文字列)と bytes(バイト列)の相互変換。bcrypt はバイト列しか
-    受け取らないため変換が要る。DBには str で保存したいので戻すとき decode。
-- datetime.now(timezone.utc)
-    タイムゾーン付きの現在時刻。JWT の exp はUTC基準のUNIX時間で扱われる
-    ので、ローカル時刻が混ざる naive な datetime.now() ではなくUTCを明示する。
-- timedelta(minutes=...) は「時間の差分」。datetime に加算できる。
-- except (A, B, C): 複数の例外型をタプルでまとめて捕まえる書き方。
+━━ JWKS(JSON Web Key Set)と kid ━━━━━━━━━━━━━━━━━━━━
+では公開鍵をどう入手するか。Keycloak は
+  {SERVER_URL}/realms/{realm}/protocol/openid-connect/certs
+で公開鍵の一覧をJSON(JWKS)として配布している。鍵は複数並びうる
+(鍵ローテーション中は新旧が共存する)ため、トークンのヘッダにある
+kid(Key ID)と突き合わせて「この署名に対応する鍵」を選ぶ。
+このHTTP取得・kid照合・キャッシュを PyJWT の PyJWKClient が全部やってくれる。
+
+━━ JITプロビジョニング(Just-In-Time)━━━━━━━━━━━━━━━━━
+ユーザーの本体(パスワード等)は Keycloak 側にあるが、quizzes.owner_id の
+ような外部キーの参照先として、アプリのDB側にも users 行が必要。
+そこで「検証済みトークンを初めて持ってきた人の行を、その場で作る」方式を
+採る(crud.get_or_create_user)。事前にユーザー一覧を同期するバッチが不要に
+なり、Keycloak側でユーザーが増えてもアプリは何もしなくてよい。
 """
-from datetime import datetime, timedelta, timezone
-
-import bcrypt
 import jwt  # パッケージ名は PyJWT、import 名は jwt。
             # 紛らわしい別物(python-jwt 等)があるので pip install は PyJWT を指定
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
-from . import models
+from . import crud, models
 from .config import settings
 from .database import get_db
 
-ALGORITHM = "HS256"  # HMAC-SHA256 = 共通鍵方式。発行者と検証者が同一サーバの
-                     # 本構成ではこれで十分(検証だけ他サービスへ配りたく
-                     # なったら公開鍵方式 RS256 等を検討する)
+ALGORITHM = "RS256"  # 公開鍵方式(RSA + SHA-256)。Keycloakのアクセストークンの既定。
+                     # 自前発行時代の HS256(共通鍵)から変えた理由は冒頭の解説を参照
 
-# OAuth2PasswordBearer のインスタンスは「呼び出し可能オブジェクト」で、
-# Depends に渡すと毎リクエストこう働く:
-#   Authorization: Bearer <token> ヘッダから <token> 部分を抜き出して返す。
-#   ヘッダが無い/形式が違えば、その場で 401 を返す(エンドポイントは実行されない)。
-# tokenUrl="/auth/login" は実際の通信処理には関与しない【ドキュメント情報】。
-# Swagger UI(/docs)がこれを読んで Authorize ボタンを生成し、
-# 「トークンはここで取得できる」と知る。おかげで /docs 上で
-# ログイン → 認証付きAPIの試行、が完結する
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+# oauth2_scheme: Authorization: Bearer <token> ヘッダから <token> を抜き出す部品。
+# ヘッダが無い/形式が違えばその場で 401(エンドポイントは実行されない)。
+# tokenUrl は通信処理には関与しない【ドキュメント情報】だが、いまや
+# アプリ自身のURLではなく Keycloak のトークンエンドポイントを指している点に注目。
+# Swagger UI(/docs)の Authorize ボタンはこのURLへ直接 username/password を
+# 送ってトークンを得る(= ログインの宛先がアプリの外であることがUIにも現れる)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=settings.keycloak_token_url)
 
-
-def hash_password(plain: str) -> str:
-    """平文パスワードを bcrypt でハッシュ化する。
-
-    bcrypt を使う理由(SHA-256 単発ではダメな理由):
-    (1) わざと遅い: gensalt のコスト係数に応じて内部で 2^n 回反復する設計。
-        DBが漏洩しても、総当たりでの復元を計算量的に非現実的にする。
-    (2) ソルト内蔵: gensalt() が毎回ランダムなソルトを生成し、結果文字列に
-        埋め込む。同じパスワードでも毎回違うハッシュになるため、
-        事前計算表(レインボーテーブル)攻撃が無効化される。
-    出力例: $2b$12$<ソルト22文字><ハッシュ31文字>
-            形式バージョン・コスト・ソルトが全部この1本に入っている。
-    """
-    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-
-def verify_password(plain: str, hashed: str) -> bool:
-    """照合。checkpw が hashed からソルトとコストを取り出し、plain を
-    同条件でハッシュし直して比較する(タイミング攻撃耐性のある比較)。
-
-    『保存ハッシュを復号して平文と比べる』のでは【ない】点に注意。
-    bcrypt は一方向関数で、復号は管理者にも誰にもできない。
-    だから「パスワードを忘れた」への正しい答えは再設定であって照会ではない。
-    """
-    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
-
-
-def create_access_token(user_id: int) -> str:
-    """user_id を主体(sub)とする署名付きトークンを発行する。"""
-    expire = datetime.now(timezone.utc) + timedelta(
-        minutes=settings.access_token_expire_minutes
-    )
-    # sub(subject)= このトークンが誰のものか。
-    #   JWT仕様(RFC 7519)上、sub は文字列でなければならない。
-    #   PyJWT 2.10 以降は int を入れるとデコード時に弾かれるため str() を通す。
-    # exp(expiration)= 期限。jwt.decode が現在時刻と自動比較し、
-    #   過ぎていれば ExpiredSignatureError を投げる(自前の期限比較は不要)
-    payload = {"sub": str(user_id), "exp": expire}
-    return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
+# JWKSクライアント(公開鍵の取得係)。モジュール読み込み時に1個だけ作って使い回す。
+# この時点ではHTTPアクセスは発生しない: 初回の検証時に取得し、以後はキャッシュが
+# 効く(cache_keys=True)ので、毎リクエスト Keycloak を叩くわけではない。
+# テストではこの変数ごと偽物に差し替える(tests/test_api.py 参照)――
+# 「外部との境界をモジュール変数に切り出しておくと差し替えやすい」という設計でもある
+jwks_client = jwt.PyJWKClient(settings.keycloak_jwks_url, cache_keys=True)
 
 
 def get_current_user(
-    # ━ 依存関係が依存関係を持つ(入れ子)━
     token: str = Depends(oauth2_scheme),  # ヘッダから Bearer トークンを抽出。
                                           # ヘッダ欠如はここで401になり、以降は実行されない
     db: Session = Depends(get_db),
     # ↑ エンドポイント側も Depends(get_db) を書いているが、FastAPI は同一
-    #   リクエスト内で同じ依存関係の結果をキャッシュする(use_cache=True が既定)。
-    #   よって get_db の実行は1リクエストに1回だけで、ここで受け取る db と
-    #   エンドポイントが受け取る db は【同一のセッション】。
-    #   同じトランザクションの一貫した世界を見ることが保証される
+    #   リクエスト内で同じ依存関係の結果をキャッシュするため、ここで受け取る db と
+    #   エンドポイントが受け取る db は【同一のセッション】(従来と同じ仕組み)
 ) -> models.User:
     """トークン → User の復元。認証が必要な全エンドポイントの共通部品。
 
-    Depends(get_current_user) と書いたエンドポイントは、この関数が
-    return した User を引数に受け取る。途中で raise された場合は
-    エンドポイント本体が一度も実行されずに 401 が返る。
+    自前認証時代と関数名・使い方(Depends で注入)は同一のまま、中身だけが
+    「自分の共通鍵で検証」→「Keycloakの公開鍵で検証 + JITプロビジョニング」
+    に入れ替わった。利用側(routers/)は1文字も変更されていない ――
+    依存関係の【中身】を差し替えても【契約】が同じなら呼び出し側は無傷、
+    という依存性注入の利点が、アーキテクチャ変更のスケールで効いた例。
     """
     # 失敗経路が複数あるので、例外オブジェクトを先に1個作って使い回す
     credentials_error = HTTPException(
@@ -131,22 +96,42 @@ def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        # decode は復元と同時に署名検証・exp検証も行う。
-        # 改竄・期限切れはここで例外として現れる。
-        # algorithms を明示的にリストで渡すのはセキュリティ上必須:
-        # 検証側がアルゴリズムをトークン側の自称に任せると、
-        # alg を弱い方式へすり替える「アルゴリズム混乱攻撃」の余地が生まれる
-        payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
-        user_id = int(payload["sub"])
-    except (jwt.InvalidTokenError, KeyError, ValueError):
-        # InvalidTokenError: 改竄・期限切れ・形式不正
-        #   (ExpiredSignatureError もこの子クラスなのでまとめて捕まる)
-        # KeyError: sub クレームが無い / ValueError: sub が数値に変換できない
-        # 失敗理由を細かく区別してクライアントへ返す必要はない
+        # (1) トークンヘッダの kid を読み、対応する公開鍵をJWKSから選ぶ
+        #     (キャッシュに無ければ、ここで Keycloak へのHTTPアクセスが走る)
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        # (2) 署名・期限・発行者を一括検証してペイロードを取り出す
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            # algorithms をこちらで明示するのはセキュリティ上必須(従来と同じ理由):
+            # トークン側の自称アルゴリズムを信用すると、弱い方式へすり替える
+            # 「アルゴリズム混乱攻撃」の余地が生まれる
+            algorithms=[ALGORITHM],
+            # iss(発行者)が、うちが信用する realm と厳密一致するかの検証。
+            # これが無いと「別realm(=別の管理者の世界)の正規トークン」まで
+            # このAPIを通れてしまう
+            issuer=settings.keycloak_issuer,
+            # aud(宛先)の検証は設定がある場合のみ有効化。
+            # Keycloak は既定では aud にこのAPIの名前を入れない(クライアント側の
+            # マッパー設定に依存)ため、配られた環境に合わせて切り替えられる形
+            audience=settings.keycloak_audience,
+            options={
+                "verify_aud": settings.keycloak_audience is not None,
+                # exp と sub が【存在すること】自体も要求する。
+                # 「expなしトークン」が永久に有効になる事故をここで塞ぐ
+                "require": ["exp", "sub"],
+            },
+        )
+    except jwt.PyJWTError:
+        # 署名不正・期限切れ・発行者不一致・形式不正・JWKS取得失敗が全部ここに来る
+        # (PyJWKClientError も PyJWTError の子クラス)。
+        # 失敗理由を細かくクライアントへ返さないのは従来と同じ方針
         # (正規ユーザーには無意味で、攻撃者へのヒントにしかならない)
         raise credentials_error
-    user = db.get(models.User, user_id)
-    if user is None:
-        # トークン自体は正規だが、ユーザーが既に削除されている等のケース
-        raise credentials_error
-    return user
+
+    # sub = Keycloak上の不変のユーザーID(UUID文字列)。
+    # preferred_username は人間向けの表示名で、Keycloak側で変更されうる。
+    # だからDBとの紐付けキーは必ず sub にする(username で紐付けると、
+    # 改名しただけで別人扱いになってしまう)
+    username = payload.get("preferred_username") or payload["sub"]
+    return crud.get_or_create_user(db, keycloak_sub=payload["sub"], username=username)

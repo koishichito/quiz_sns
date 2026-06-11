@@ -1,7 +1,7 @@
 """アプリ全体の設定を一箇所に集める層。環境変数 / .env ファイルから読み込む。
 
 ━━ なぜこの層があるか ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DB接続文字列やJWT署名鍵のような「環境ごとに変わる値」「秘密の値」を
+DB接続文字列やKeycloakの接続先のような「環境ごとに変わる値」「秘密の値」を
 ソースコードに直書きすると、
   (1) git に秘密が残る(漏洩事故の典型)
   (2) 開発/本番で値を切り替えるたびにコードを書き換える羽目になる
@@ -50,12 +50,43 @@ class Settings(BaseSettings):
     # ↑ 文字列を ( ) で囲んで改行しているのは単に1行が長いから。
     #   括弧の中では自由に改行できる(Python の行継続の基本)
 
-    # JWTの署名鍵。これが漏れるとトークンを偽造できてしまう。
-    # 本番では必ず .env でランダム値に上書きする(openssl rand -hex 32 など)
-    secret_key: str = "dev-only-secret-change-me"
+    # ━ Keycloak(外部の認証サーバ)関連 ━
+    # 認証はアプリの外 = Keycloak に委譲した。だから SECRET_KEY(自前の署名鍵)は
+    # もう存在しない。アプリが知るべきは「どの Keycloak の、どの realm を
+    # 信用するか」だけ。値は配られた環境のものを .env に書く
+    keycloak_server_url: str = "http://localhost:8080"
+    keycloak_realm: str = "quiz-sns"
 
-    # int 宣言なので、環境変数の "60"(文字列)も 60(整数)に自動変換される
-    access_token_expire_minutes: int = 60
+    # トークン取得時にクライアントが名乗るID。トークンの【検証】そのものには
+    # 使わないが、Swagger UI のログイン導線や README の curl 例で参照する
+    keycloak_client_id: str = "quiz-sns-api"
+
+    # str | None = None なので「設定しなくてよい」項目。
+    # 設定すると aud(宛先)クレームの検証が有効になる(auth.py 参照)。
+    # Keycloak は既定では aud にこのAPIの名前を入れない(クライアント側の
+    # マッパー設定に依存する)ため、配られた環境に合わせてオン/オフできる形にしてある
+    keycloak_audience: str | None = None
+
+    # ━ @property = 「計算で求まる設定値」━
+    # 下の3つは独立した設定ではなく server_url と realm から機械的に決まる。
+    # 別々の環境変数にすると「realm だけ変えて issuer を変え忘れる」事故が
+    # 起きるので、導出ロジックごと一箇所に固める
+
+    @property
+    def keycloak_issuer(self) -> str:
+        """トークンの iss(発行者)クレームと厳密一致すべき値。
+        Keycloak では realm のURLがそのまま発行者名になる。"""
+        return f"{self.keycloak_server_url.rstrip('/')}/realms/{self.keycloak_realm}"
+
+    @property
+    def keycloak_jwks_url(self) -> str:
+        """署名検証用の公開鍵一覧(JWKS)の配布エンドポイント。"""
+        return f"{self.keycloak_issuer}/protocol/openid-connect/certs"
+
+    @property
+    def keycloak_token_url(self) -> str:
+        """トークン発行エンドポイント。ログインの宛先はアプリではなく【ここ】。"""
+        return f"{self.keycloak_issuer}/protocol/openid-connect/token"
 
 
 # モジュール読み込み時に1回だけインスタンス化し、全モジュールでこれを使い回す

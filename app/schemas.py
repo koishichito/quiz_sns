@@ -9,8 +9,9 @@
 
 ━━ なぜ ORMモデル(models.py)と分けるか ━━━━━━━━━━━━━━━━
 DBの都合とAPIの都合は別物だから。
-例1: users テーブルには hashed_password があるが、UserRead に書かない限り
-     レスポンスには絶対含まれない(「気をつける」ではなく「漏れる経路が無い」)。
+例1: users テーブルには keycloak_sub(Keycloakとの内部連携ID)があるが、
+     UserRead に書かない限りレスポンスには絶対含まれない
+     (「気をつける」ではなく「漏れる経路が無い」)。
 例2: QuizCreate に owner_id は無い(投稿者はトークンから決める。クライアントに
      自己申告させたら他人になりすませる)が、quizzes テーブルには owner_id がある。
      入力の形と保存の形は一致しない、が普通。
@@ -45,14 +46,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ---------- User ----------
-
-class UserCreate(BaseModel):
-    username: str = Field(min_length=3, max_length=50)
-    # bcrypt はアルゴリズムの仕様上、72バイトを超える部分を【黙って無視】する。
-    # 「100文字のパスワードのつもりが先頭72バイトしか効いていなかった」
-    # という事故を防ぐため、入口で上限を明示しておく
-    password: str = Field(min_length=8, max_length=72)
-
+# UserCreate(登録の入力)と Token(ログインの応答)はKeycloak移行で消えた。
+# ユーザーの「入力」はもうこのAPIに存在せず、出力(UserRead)だけが残っている。
+# スキーマが消える = そのデータがアプリの責任範囲から外れた、という構造の変化が
+# 契約(このファイル)にそのまま現れている
 
 class UserRead(BaseModel):
     # from_attributes=True:
@@ -66,15 +63,7 @@ class UserRead(BaseModel):
     id: int
     username: str
     created_at: datetime  # datetime は ISO 8601 文字列としてJSON化される
-    # hashed_password をここに書かない = 何があっても外に出ない
-
-
-# ---------- 認証トークン ----------
-
-class Token(BaseModel):
-    """ログイン成功時のレスポンス。フィールド名は OAuth2 の慣例に合わせてある。"""
-    access_token: str
-    token_type: str = "bearer"  # デフォルト値あり = 作る側は省略できる
+    # keycloak_sub をここに書かない = 内部の連携IDは何があっても外に出ない
 
 
 # ---------- Quiz ----------
