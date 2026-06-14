@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<!-- lang="ja" は文書の言語。スクリーンリーダや翻訳のヒントになる -->
+<html lang="ja">
+<head>
+  <!-- charset は文字コード宣言。日本語の文字化けを防ぐため UTF-8 を最初に書く -->
+  <meta charset="UTF-8" />
+  <title>Quiz SNS(Keycloak 認証)</title>
+  <!-- 注: 見た目(CSS)は学習用に意図的に省略している。動作と記法に集中するため -->
+</head>
+<body>
+  <!-- ログイン状態の表示先。app.js の refreshAuthStatus() が /auth/me で更新する。
+       ここに「ログイン中: ○○」が出れば、Keycloak のトークンがこのAPIで
+       通用している(=認証が噛み合っている)ことの証拠になる -->
+  <p>状態: <span id="auth-status">確認中…</span></p>
+
+  <h1>クイズ一覧</h1>
+  <!-- JS の loadQuizzes() がこの <ul> の中に <li> を差し込む。
+       id で JS から特定できるようにしておくのがポイント -->
+  <ul id="quiz-list"></ul>
+
+  <h2>ログイン</h2>
+  <!-- ログインの宛先は【このAPIではなく Keycloak】(api.js の login() 参照)。
+       ユーザー名・パスワードは Keycloak に登録されたもの。
+       ※ 新規ユーザー登録は Keycloak の管理コンソール / アカウント画面で行う
+         (このAPIに登録機能は無い ―― 認証は Keycloak へ委譲済み)。 -->
+  <input id="login-username" placeholder="ユーザー名(Keycloak)" />
+  <!-- type="password" で入力が伏字になる -->
+  <input id="login-password" type="password" placeholder="パスワード(Keycloak)" />
+  <button id="btn-login">ログイン</button>
+  <button id="btn-logout">ログアウト</button>
+  <!-- 結果メッセージの差し込み先。最初は空 -->
+  <p id="login-msg"></p>
+
+  <h2>クイズ投稿</h2>
+  <!-- 投稿は認証必須。先にログインしてトークンを得ておくこと -->
+  <input id="quiz-title" placeholder="タイトル" /><br />
+  <textarea id="quiz-question" placeholder="問題文"></textarea><br />
+  <textarea id="quiz-choices" placeholder="選択肢を1行に1つ"></textarea><br />
+  <!-- type="number" で数値用の入力欄になる(が .value は文字列なので JS 側で Number 変換) -->
+  <input id="quiz-answer" type="number" placeholder="正解番号(0始まり)" /><br />
+  <textarea id="quiz-explanation" placeholder="解説(任意)"></textarea><br />
+  <button id="btn-create">投稿</button>
+  <p id="create-msg"></p>
+
+  <!-- 読み込み順が重要:
+       api.js(apiFetch・login などを定義)を先に、app.js(それらを呼ぶ)を後に。
+       両方クラシックスクリプトなので同じグローバルスコープを共有し、
+       app.js から api.js の関数が import 無しで見える。 -->
+  <script src="api.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

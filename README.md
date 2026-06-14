@@ -36,6 +36,10 @@ quiz_sns/
 │       ├── auth.py      # GET /auth/me(トークン疎通確認。register/loginはKeycloakへ移管)
 │       ├── quizzes.py   # /quizzes の一覧・投稿・詳細・削除
 │       └── comments.py  # /quizzes/{quiz_id}/comments の一覧・投稿
+├── frontend/            # 最小フロントエンド(素のJS。Keycloakでログインする)
+│   ├── index.html       # 画面
+│   ├── api.js           # 通信層: login()→Keycloak / apiFetch()→このAPI
+│   └── app.js           # 画面ロジック(入力取得→呼び出し→描画)
 ├── tests/
 │   └── test_api.py      # 結合テスト(DB→SQLite、Keycloak→自作RSA鍵に差し替え)
 ├── requirements.txt
@@ -147,6 +151,43 @@ curl -X POST http://127.0.0.1:8000/quizzes/1/comments \
 # 6. 詳細(コメント込み)
 curl http://127.0.0.1:8000/quizzes/1
 ```
+
+## フロントエンド(frontend/)
+
+素のHTML+JSだけの最小フロントエンド。ビルド不要。ログインは
+**ブラウザから Keycloak のトークンエンドポイントへ直接**(Direct Access Grant)行い、
+得たアクセストークンを `localStorage` に保存して、以降このAPIへ `Bearer` で添える。
+このAPIには登録・ログイン機能が無い(Keycloakへ委譲済み)ので、フロントの
+ログインも宛先が Keycloak になっている点が要。
+
+```bash
+cd frontend
+python -m http.server 5173   # http://localhost:5173 で配信
+```
+
+ブラウザで http://localhost:5173 を開く。`frontend/api.js` 冒頭の設定を、
+配られた環境に合わせる:
+
+- `API_BASE` … このAPI(FastAPI)のURL。既定 `http://localhost:8000`
+- `KEYCLOAK_BASE` / `KEYCLOAK_REALM` / `KEYCLOAK_CLIENT_ID`
+  … **このAPIの `.env`(`KEYCLOAK_*`)と必ず同じ値にする**。
+  食い違うと、得たトークンを API 側が「別realmの物」として弾く。
+
+CORS の注意(2か所):
+
+1. **ブラウザ → このAPI**: API 側 `app/main.py` の `allow_origins` に
+   フロントの配信元が必要。既定で `http://localhost:5173` と `:3000` を許可済み
+   なので、上記の `5173` で配信すればそのまま通る。
+2. **ブラウザ → Keycloak**(ログイン時): Keycloak 側クライアントの **Web origins** に
+   `http://localhost:5173` を加えておく。無いと応答を読めず CORS で失敗する。
+
+画面上部の「状態: ログイン中: ○○」表示は `/auth/me` の結果で、トークンが
+このAPIで通用している(=Keycloakと噛み合っている)ことの確認になる。
+
+> 本番では、ブラウザがパスワードを直接握る Direct Access Grant ではなく、
+> Keycloak のログイン画面へリダイレクトする **Authorization Code + PKCE** が推奨。
+> 切り替え方は `frontend/api.js` 末尾の注記参照(`apiFetch` を境界にしてあるので
+> 画面ロジック `app.js` は無修正で済む)。
 
 ## テスト
 
