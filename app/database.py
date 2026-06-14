@@ -36,16 +36,29 @@ from .config import settings
 #   python app/database.py のような直接実行では ImportError で壊れる。
 #   起動は必ず uvicorn app.main:app のようにパッケージ経由で行う。
 
-engine = create_engine(
-    settings.database_url,
-    # ━ MySQL 運用で事実上必須の2点 ━
-    # MySQL は wait_timeout(既定8時間)を過ぎたアイドル接続をサーバ側から切る。
-    # 切れた接続をプールから掴むと "MySQL server has gone away" になるため:
-    pool_pre_ping=True,  # 接続を使う直前に軽い疎通確認(SELECT 1 相当)を打つ
-    pool_recycle=3600,   # 3600秒より古い接続は捨てて作り直す
-    echo=False,  # True にすると発行SQLが全部ログに出る。学習中は True を強く推奨。
-                 # ORMが裏で何をしているか(N+1問題の有無など)が目視できる
-)
+# DATABASE_URL が sqlite のとき(= MySQL を立てずにローカルで手早く動かしたいとき)
+# だけ SQLite 固有の引数に切り替える。本番想定の MySQL 経路の挙動は一切変えない。
+if settings.database_url.startswith("sqlite"):
+    # SQLite は既定で「接続を作ったスレッド以外からの利用」を禁止する。
+    # FastAPI は同期エンドポイントを別スレッドプールで実行する(main.py のコメント参照)
+    # ため、このチェックを外さないと最初のDBアクセスで例外になる。
+    # MySQL 用の pool_pre_ping / pool_recycle は SQLite には不要なので付けない。
+    engine = create_engine(
+        settings.database_url,
+        connect_args={"check_same_thread": False},  # ドライバ(sqlite3)へ直接渡す
+        echo=False,
+    )
+else:
+    engine = create_engine(
+        settings.database_url,
+        # ━ MySQL 運用で事実上必須の2点 ━
+        # MySQL は wait_timeout(既定8時間)を過ぎたアイドル接続をサーバ側から切る。
+        # 切れた接続をプールから掴むと "MySQL server has gone away" になるため:
+        pool_pre_ping=True,  # 接続を使う直前に軽い疎通確認(SELECT 1 相当)を打つ
+        pool_recycle=3600,   # 3600秒より古い接続は捨てて作り直す
+        echo=False,  # True にすると発行SQLが全部ログに出る。学習中は True を強く推奨。
+                     # ORMが裏で何をしているか(N+1問題の有無など)が目視できる
+    )
 # create_engine はこの時点では DB に接続しない(遅延接続)。
 # 最初に実際のクエリが流れた瞬間、初めて物理接続が張られる。
 
