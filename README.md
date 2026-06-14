@@ -49,6 +49,11 @@ quiz_sns/
 読む順番の推奨: `main.py` → `routers/` → `auth.py` → `crud.py` → `models.py`。
 入出力の形で迷ったら `schemas.py`、土台は `database.py` / `config.py`。
 
+各ファイルに定義されたオブジェクト(ORMモデル / Pydanticスキーマ / CRUD関数 / 認証部品 /
+ルーター・エンドポイント / フロントの関数・定数)を1つ残らず解説した
+**オブジェクトリファレンス**を [OBJECTS.md](OBJECTS.md) に置いた。
+「このクラス/関数は何者か」を引きたいときはそちらを参照。
+
 ## セットアップ
 
 ### 1. MySQL 8 側の準備
